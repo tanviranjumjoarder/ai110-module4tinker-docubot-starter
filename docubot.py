@@ -9,6 +9,26 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
+
+# Words that show up in almost every question and say nothing about the topic.
+# If we counted them, "Where is the token?" would match every file that has "is" or "the".
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for",
+    "from", "how", "i", "if", "in", "is", "it", "of", "on", "or", "the", "this",
+    "to", "what", "when", "where", "which", "who", "why", "with", "there", "any",
+    "these", "that", "my", "me", "we", "you", "your", "all",
+}
+
+
+def tokenize(text):
+    """Lowercase the text and split it into plain words (letters and digits only)."""
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def query_terms(query):
+    """The meaningful words in a question: tokenized, stopwords removed, no repeats."""
+    return {word for word in tokenize(query) if word not in STOPWORDS}
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -64,7 +84,9 @@ class DocuBot:
         ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for filename, text in documents:
+            for word in set(tokenize(text)):
+                index.setdefault(word, []).append(filename)
         return index
 
     # -----------------------------------------------------------
@@ -81,8 +103,8 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        # TODO: implement scoring
-        return 0
+        words_in_text = set(tokenize(text))
+        return sum(1 for term in query_terms(query) if term in words_in_text)
 
     def retrieve(self, query, top_k=3):
         """
@@ -91,9 +113,19 @@ class DocuBot:
 
         Return a list of (filename, text) sorted by score descending.
         """
+        # Use the index to find only the files that share at least one word with the query.
+        candidates = set()
+        for term in query_terms(query):
+            candidates.update(self.index.get(term, []))
+
         results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        for filename, text in self.documents:
+            if filename in candidates:
+                score = self.score_document(query, text)
+                results.append((score, filename, text))
+
+        results.sort(key=lambda item: item[0], reverse=True)
+        return [(filename, text) for _, filename, text in results[:top_k]]
 
     # -----------------------------------------------------------
     # Answering Modes
