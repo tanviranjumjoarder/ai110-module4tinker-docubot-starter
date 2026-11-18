@@ -20,15 +20,56 @@ STOPWORDS = {
     "these", "that", "my", "me", "we", "you", "your", "all",
 }
 
+# Guardrail: a section only counts as evidence if it shares at least this many
+# meaningful words with the question. One shared word is usually a coincidence
+# (for example "docs" or "api"), so we ask for two.
+MIN_MATCHING_TERMS = 2
+
+
+def normalize(word):
+    """
+    Very small stemmer so different forms of a word match:
+    "users" -> "user", "generated"/"generation" -> "generat", "connection" -> "connect".
+    """
+    for suffix in ("ing", "ed", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            word = word[: -len(suffix)]
+            break
+    if word.endswith("ion") and len(word) > 6:
+        word = word[:-3]
+    if word.endswith("e") and len(word) > 3:
+        word = word[:-1]
+    return word
+
 
 def tokenize(text):
-    """Lowercase the text and split it into plain words (letters and digits only)."""
-    return re.findall(r"[a-z0-9]+", text.lower())
+    """Lowercase the text, split it into plain words, and normalize each word."""
+    return [normalize(w) for w in re.findall(r"[a-z0-9]+", text.lower())]
 
 
 def query_terms(query):
-    """The meaningful words in a question: tokenized, stopwords removed, no repeats."""
-    return {word for word in tokenize(query) if word not in STOPWORDS}
+    """The meaningful words in a question: stopwords removed, normalized, no repeats."""
+    words = re.findall(r"[a-z0-9]+", query.lower())
+    return {normalize(w) for w in words if w not in STOPWORDS}
+
+
+def split_into_sections(text):
+    """
+    Cut one markdown file into sections, starting a new section at every heading.
+    A heading with nothing under it (like "## User Data Endpoints") is glued onto
+    the next section so it is never returned on its own.
+    """
+    sections = []
+    current = []
+    for line in text.splitlines():
+        if line.startswith("#") and any(l.strip() and not l.startswith("#") for l in current):
+            sections.append("\n".join(current).strip())
+            current = []
+        current.append(line)
+    if any(l.strip() for l in current):
+        sections.append("\n".join(current).strip())
+    return sections
+
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -42,8 +83,15 @@ class DocuBot:
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
 
-        # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        # Retrieval works on sections, not whole files. Each chunk is (filename, section_text).
+        self.chunks = [
+            (filename, section)
+            for filename, text in self.documents
+            for section in split_into_sections(text)
+        ]
+
+        # Inverted index: word -> positions in self.chunks that contain it
+        self.index = self.build_index(self.chunks)
 
     # -----------------------------------------------------------
     # Document Loading
@@ -56,7 +104,7 @@ class DocuBot:
         """
         docs = []
         pattern = os.path.join(self.docs_folder, "*.*")
-        for path in glob.glob(pattern):
+        for path in sorted(glob.glob(pattern)):
             if path.endswith(".md") or path.endswith(".txt"):
                 with open(path, "r", encoding="utf8") as f:
                     text = f.read()
@@ -65,67 +113,64 @@ class DocuBot:
         return docs
 
     # -----------------------------------------------------------
-    # Index Construction (Phase 1)
+    # Index Construction
     # -----------------------------------------------------------
 
     def build_index(self, documents):
         """
-        TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
+        Build an inverted index: each word maps to the positions (in `documents`)
+        of every piece of text that contains it.
 
-        Example structure:
-        {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
-        }
-
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
+        Example: {"token": [3, 4, 9], "databas": [14, 15]}
         """
         index = {}
-        for filename, text in documents:
+        for position, (_, text) in enumerate(documents):
             for word in set(tokenize(text)):
-                index.setdefault(word, []).append(filename)
+                index.setdefault(word, []).append(position)
         return index
 
     # -----------------------------------------------------------
-    # Scoring and Retrieval (Phase 1)
+    # Scoring and Retrieval
     # -----------------------------------------------------------
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
-        Return a simple relevance score for how well the text matches the query.
-
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        Score = how many different meaningful question words appear in the text.
+        Each word counts once, so a long section that repeats "token" ten times
+        does not beat a short section that matches more of the question.
         """
         words_in_text = set(tokenize(text))
         return sum(1 for term in query_terms(query) if term in words_in_text)
 
     def retrieve(self, query, top_k=3):
         """
-        TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
-
-        Return a list of (filename, text) sorted by score descending.
+        Return up to top_k (filename, section_text) pairs, best match first.
+        Sections that match fewer than MIN_MATCHING_TERMS question words are dropped,
+        so an empty list means "the docs do not cover this".
         """
-        # Use the index to find only the files that share at least one word with the query.
+        terms = query_terms(query)
+        needed = min(MIN_MATCHING_TERMS, len(terms))
+        if needed == 0:
+            return []
+
+        # Only look at sections that share at least one word with the question.
         candidates = set()
-        for term in query_terms(query):
+        for term in terms:
             candidates.update(self.index.get(term, []))
 
-        results = []
-        for filename, text in self.documents:
-            if filename in candidates:
-                score = self.score_document(query, text)
-                results.append((score, filename, text))
+        scored = []
+        for position in candidates:
+            filename, text = self.chunks[position]
+            score = self.score_document(query, text)
+            if score >= needed:
+                # Tie-breaks: first the section that mentions the question words
+                # more often, then the shorter (more focused) section.
+                words = tokenize(text)
+                mentions = sum(1 for w in words if w in terms)
+                scored.append((score, mentions, -len(text), position))
 
-        results.sort(key=lambda item: item[0], reverse=True)
-        return [(filename, text) for _, filename, text in results[:top_k]]
+        scored.sort(reverse=True)
+        return [self.chunks[position] for *_, position in scored[:top_k]]
 
     # -----------------------------------------------------------
     # Answering Modes
@@ -139,7 +184,7 @@ class DocuBot:
         snippets = self.retrieve(query, top_k=top_k)
 
         if not snippets:
-            return "I do not know based on these docs."
+            return "I do not know based on the docs I have."
 
         formatted = []
         for filename, text in snippets:
@@ -161,7 +206,7 @@ class DocuBot:
         snippets = self.retrieve(query, top_k=top_k)
 
         if not snippets:
-            return "I do not know based on these docs."
+            return "I do not know based on the docs I have."
 
         return self.llm_client.answer_from_snippets(query, snippets)
 
